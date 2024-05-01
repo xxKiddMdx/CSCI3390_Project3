@@ -9,112 +9,118 @@ import org.apache.spark.graphx._
 import org.apache.spark.storage.StorageLevel
 import org.apache.log4j.{Level, Logger}
 
-object main{
+object main {
+  // Set logging levels to reduce console noise
   val rootLogger = Logger.getRootLogger()
   rootLogger.setLevel(Level.ERROR)
 
   Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
   Logger.getLogger("org.spark-project").setLevel(Level.WARN)
 
-  case class VertexProperties(id: Long, degree: Int, value: Double, active: String, in_MIS: String)
+  // Define a case class to store vertex properties
+  case class VertexProperties(vertexId: Long, vertexDegree: Int, randomValue: Double, status: String, isInMIS: String)
 
-  def anyActive(g:Graph[VertexProperties, Int]): Boolean = {
-    g.vertices.filter{ case (id, vp) => vp.active == "active"}.count() > 0
+  // Function to check if any vertices are still 'active'
+  def isAnyVertexActive(graph: Graph[VertexProperties, Int]): Boolean = {
+    graph.vertices.filter{ case (_, properties) => properties.status == "active"}.count() > 0
   }
 
-  def inRDD(rdd: RDD[Long], value: Long): Boolean = {
-    rdd.filter(x => x == value).count() > 0
+  // Function to check if a specific value exists in an RDD
+  def isValueInRDD(rdd: RDD[Long], targetValue: Long): Boolean = {
+    rdd.filter(_ == targetValue).count() > 0
   }
 
-  def LubyMIS(g_in: Graph[Int, Int]): Graph[Int, Int] = {
-    var mis_vertices = Set[Long]()
-    val degrees = g_in.degrees
-    var degree_graph = g_in.outerJoinVertices(degrees)({ case (_, _, prop) => prop.getOrElse(0)})
-    var g_mod = degree_graph.mapVertices((id, degree) => VertexProperties(id, degree, -0.1, "active", "No"))
-    g_mod.cache()
+  // Implementation of Luby's Maximal Independent Set (MIS) algorithm
+  def LubyMIS(graphInput: Graph[Int, Int]): Graph[Int, Int] = {
+    var selectedVertices = Set[Long]()
+    val vertexDegrees = graphInput.degrees
+    var graphWithDegrees = graphInput.outerJoinVertices(vertexDegrees)({ case (_, _, optDegree) => optDegree.getOrElse(0)})
+    var modifiedGraph = graphWithDegrees.mapVertices((id, degree) => VertexProperties(id, degree, -0.1, "active", "No"))
+    modifiedGraph.cache() // Cache the graph for performance
 
-    var iterations = 0
+    var numIterations = 0
 
-    while(anyActive(g_mod)){
-      g_mod = g_mod.mapVertices((_, prop: VertexProperties) => {
-        if (prop.active != "active") {
-          prop
+    // Iterate until no active vertices remain
+    while(isAnyVertexActive(modifiedGraph)){
+      modifiedGraph = modifiedGraph.mapVertices((_, properties: VertexProperties) => {
+        if (properties.status != "active") {
+          properties
         } else {
           val rand = new scala.util.Random
-          VertexProperties(prop.id, prop.degree, rand.nextDouble(), prop.active, prop.in_MIS)
+          VertexProperties(properties.vertexId, properties.vertexDegree, rand.nextDouble(), properties.status, properties.isInMIS)
         }
       })
 
-      val highest_neighbor: VertexRDD[VertexProperties] = g_mod.aggregateMessages[VertexProperties](
+      // Aggregate messages to find the vertex with the highest random value in each neighborhood
+      val highestNeighborValues: VertexRDD[VertexProperties] = modifiedGraph.aggregateMessages[VertexProperties](
         triplet => {
           triplet.sendToDst(triplet.srcAttr)
           triplet.sendToSrc(triplet.dstAttr)
         },
-        (prop1, prop2) => {
-          if (prop1.value > prop2.value) {
-            prop1
-          } else {
-            prop2
-          }
-        }
+        (firstProp, secondProp) => if (firstProp.randomValue > secondProp.randomValue) firstProp else secondProp
       )
 
-      val joinedVertices = g_mod.vertices.join(highest_neighbor).filter({
-        case (_, (prop, competing)) => prop.active == "active"
+      // Filter out the vertices that are superior in their neighborhood
+      val joinedVertexProperties = modifiedGraph.vertices.join(highestNeighborValues).filter({
+        case (_, (properties, competing)) => properties.status == "active"
       })
 
-      val message_comparison = joinedVertices.filter({
-        case (id, (prop: VertexProperties, competing: VertexProperties)) => {
-          prop.value > competing.value
-        }
+      val superiorVertexProperties = joinedVertexProperties.filter({
+        case (_, (properties, competing)) => properties.randomValue > competing.randomValue
       })
 
-      val vertexIds_mis = message_comparison.map({ case ((id, (prop, competing))) => prop.id}).distinct().collect().toSet
-      val in_mis_graph = g_in.mapVertices((id, _) => vertexIds_mis.contains(id))
-      val neighbor_in_mis: VertexRDD[Boolean] = in_mis_graph.aggregateMessages[Boolean](
+      // Update the graph based on the vertices selected in this iteration
+      val vertexIdsSelected = superiorVertexProperties.map({ case ((id, (properties, _))) => properties.vertexId}).distinct().collect().toSet
+      val activeInMISGraph = graphInput.mapVertices((id, _) => vertexIdsSelected.contains(id))
+      val neighborsInMIS: VertexRDD[Boolean] = activeInMISGraph.aggregateMessages[Boolean](
         triplet => {
           triplet.sendToDst(triplet.srcAttr)
           triplet.sendToSrc(triplet.dstAttr)
         },
-        (a, b) => a || b
+        _ || _
       )
-      val mis_neighbors = neighbor_in_mis.filter({ case (id, in_mis) => in_mis}).map({ case (id, _) => id}).distinct().collect().toSet
+      val neighborVertices = neighborsInMIS.filter({ case (_, isInMIS) => isInMIS}).map({ case (id, _) => id}).distinct().collect().toSet
 
-      g_mod = g_mod.mapVertices((id, prop) => {
-        if (vertexIds_mis.contains(id)) {
-          VertexProperties(prop.id, prop.degree, -0.1, "inactive", "Yes")
-        } else if (mis_neighbors.contains(id)) {
-          VertexProperties(prop.id, prop.degree, -0.1, "inactive", "No")
+      // Deactivate vertices and update their MIS status
+      modifiedGraph = modifiedGraph.mapVertices((id, properties) => {
+        if (vertexIdsSelected.contains(id)) {
+          VertexProperties(properties.vertexId, properties.vertexDegree, -0.1, "inactive", "Yes")
+        } else if (neighborVertices.contains(id)) {
+          VertexProperties(properties.vertexId, properties.vertexDegree, -0.1, "inactive", "No")
         } else {
-          prop
+          properties
         }
       })
-      println("\tNumber of vertices remaining: " + g_mod.vertices.filter({ case (id, prop) => prop.active == "active"}).count())
-      iterations += 1
+      println("\tNumber of vertices remaining: " + modifiedGraph.vertices.filter({ case (_, properties) => properties.status == "active"}).count())
+      numIterations += 1
     }
-    println("Number of iterations: " + iterations)
-    val vertexRDD = g_mod.vertices
+    println("Number of iterations: " + numIterations)
+    val vertexRDD = modifiedGraph.vertices
 
-    val verticeInMIS: RDD[VertexId] = vertexRDD
-      .filter{ case (_, prop) => prop.in_MIS == "Yes"}
+    // Collect vertices that are in the MIS
+    val verticesInMIS: RDD[VertexId] = vertexRDD
+      .filter{ case (_, properties) => properties.isInMIS == "Yes"}
       .map { case (id, _) => id}
 
-    val vertexIDs: Array[VertexId] = verticeInMIS.collect()
-    val out_graph = g_in.mapVertices((id, _) => if (vertexIDs.contains(id)) 1 else -1)
-    return out_graph
+    // Final output graph where vertices in MIS are marked as '1', others as '-1'
+    val vertexIdsInMIS: Array[VertexId] = verticesInMIS.collect()
+    val outputGraph = graphInput.mapVertices((id, _) => if (vertexIdsInMIS.contains(id)) 1 else -1)
+    return outputGraph
   }
 
-def hasNeighborWithAttributeOne(triplet: EdgeContext[Int, Int, Boolean], from: String): Boolean = {
-      if (triplet.srcAttr == 1 && from == "to_dst") {
+  // Helper function to check if a neighbor with a specific attribute exists
+  def hasNeighborWithAttributeOne(triplet: EdgeContext[Int, Int, Boolean], direction: String): Boolean = {
+    if (triplet.srcAttr == 1 && direction == "to_dst") {
       return true
-    } else if (triplet.srcAttr == -1 && from == "to_dst") {
+    } else if (triplet.srcAttr == -1 && direction == "to_dst") {
       return false
-    } else if (triplet.dstAttr == 1 && from == "to_src") {
+    } else if (triplet.dstAttr == 1 && direction == "to_src") {
       return true
     } else {
       return false
     }
   }
+
 
 def verifyMIS(g: Graph[Int, Int]): Boolean = {
   val independent = g.triplets.flatMap { triplet =>
